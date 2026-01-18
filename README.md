@@ -5,7 +5,7 @@ Welcome to the future of sports engagement! **BOXMEOUT STELLA** is a groundbreak
 ---
 
 ## Technical Documentation
-**Prepared by:** [Your Name] | **GitHub:** [Your GitHub URL] | **Contact:** [Your Email] | **Telegram:** [Your Handle]
+**Prepared by:** [techhunter] | **GitHub:** [GoSTEAN] | **Contact:** [Your Email] | **Telegram:** [GoSTEAM]
 
 ## Project Overview
 ### What is the Wrestling Prediction Market?
@@ -76,26 +76,6 @@ Traditional betting has faced recurring issues:
 - **Threshold Signatures:** Advanced privacy for bet commitments.
 - **Fiat On-Ramps:** Direct USD/EUR deposits via regulated Stellar anchors.
 
-## Revenue Model
-- **Transaction Fees (2-4%):**
-  - 2% for bets < $50
-  - 3% for bets $50-$500
-  - 4% for bets > $500
-- **Market Creation Fees:** 0.5-2 XLM per market.
-- **Premium Subscriptions:** Pro ($5/mo) and Elite ($15/mo) tiers with lower fees and AI tools.
-- **NFT Marketplace Commission:** 3% on secondary trading volume.
-
-## Why Stellar?
-### Technical Justification
-| Feature | Stellar | Ethereum L1 | Ethereum L2 |
-| :--- | :--- | :--- | :--- |
-| **Transaction Speed** | 3-5 seconds | 12-15 seconds | 2-10 seconds |
-| **Transaction Cost** | ~$0.000003 | $5-$50 | $0.50-$5 |
-| **Smart Contracts** | Soroban (Rust/Wasm) | Solidity | Solidity |
-| **Finality** | 3-5 seconds | 12-15 minutes | Varies |
-| **Fiat On-Ramps** | Native Anchors | Third-party only | Third-party only |
-
-**Winner for Betting:** Stellar's speed and cost make it ideal for high-frequency, small-value interactions.
 
 ## Technical Architecture
 ### Smart Contract Structure (Soroban/Rust)
@@ -197,6 +177,13 @@ npm install
 npm run dev
 ```
 
+## CI/CD Status
+
+[![Contracts CI](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/contracts.yml/badge.svg)](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/contracts.yml)
+[![Backend CI](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/backend.yml/badge.svg)](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/backend.yml)
+[![Frontend CI](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/frontend.yml/badge.svg)](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/frontend.yml)
+[![Security](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/security.yml/badge.svg)](https://github.com/Netwalls/BOXMEOUT_STELLA/actions/workflows/security.yml)
+
 ## Testing
 
 ```bash
@@ -209,6 +196,38 @@ cargo test --test factory_test
 
 # View test output
 cargo test -- --nocapture
+
+# Run backend tests
+cd backend
+npm test
+
+# Run frontend tests
+cd frontend
+npm test
+```
+
+## GitHub Actions Workflows
+
+We use GitHub Actions for automated CI/CD. See [.github/workflows/README.md](.github/workflows/README.md) for details on:
+- ✅ Smart contract testing
+- ✅ Backend API testing
+- ✅ Frontend build validation
+- ✅ Security & dependency audits
+- ✅ Code quality analysis
+- ✅ PR validation
+
+### Contributing
+
+Please follow [Conventional Commits](https://www.conventionalcommits.org/) format:
+
+```
+type(scope): description
+
+Examples:
+- feat(contracts): implement Factory.create_market()
+- fix(backend): resolve auth middleware issue
+- docs: update API documentation
+- test(amm): add edge case tests for buy_shares()
 ```
 ---
 
