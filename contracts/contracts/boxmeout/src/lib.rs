@@ -32,6 +32,7 @@ mod treasury;
 mod oracle;
 
 // Helper modules - Always included for utility functions
+#[allow(dead_code, unused_imports)]
 mod helpers;
 
 // ============================================================================
