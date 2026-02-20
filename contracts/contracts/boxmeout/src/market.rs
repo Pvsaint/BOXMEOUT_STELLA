@@ -2,7 +2,8 @@
 // Handles predictions, bet commitment/reveal, market resolution, and winnings claims
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal,
+    Symbol, Vec,
 };
 
 // Storage keys
@@ -23,11 +24,18 @@ const PREDICTION_PREFIX: &str = "prediction";
 const WINNING_OUTCOME_KEY: &str = "winning_outcome";
 const WINNER_SHARES_KEY: &str = "winner_shares";
 const LOSER_SHARES_KEY: &str = "loser_shares";
+const DISPUTE_PREFIX: &str = "dispute";
+const DISPUTE_COUNT_KEY: &str = "dispute_cnt";
+const PAYOUTS_FROZEN_KEY: &str = "pay_frozen";
 
 /// Market states
 const STATE_OPEN: u32 = 0;
 const STATE_CLOSED: u32 = 1;
 const STATE_RESOLVED: u32 = 2;
+const STATE_DISPUTED: u32 = 3;
+
+/// Minimum dispute stake (10 USDC at 7 decimals)
+const MIN_DISPUTE_STAKE: i128 = 10_000_000;
 
 /// Error codes following Soroban best practices
 #[contracterror]
@@ -54,6 +62,16 @@ pub enum MarketError {
     NotWinner = 9,
     /// Market not yet resolved
     MarketNotResolved = 10,
+    /// User did not participate in the market
+    NotParticipant = 11,
+    /// Dispute window has expired (past 7 days after resolution)
+    DisputeWindowExpired = 12,
+    /// Stake below minimum required for dispute
+    InsufficientDisputeStake = 13,
+    /// User has already disputed this market
+    DuplicateDispute = 14,
+    /// Payouts are frozen due to active dispute
+    PayoutsFrozen = 15,
 }
 
 /// Commitment record for commit-reveal scheme
@@ -74,6 +92,17 @@ pub struct UserPrediction {
     pub outcome: u32,
     pub amount: i128,
     pub claimed: bool,
+    pub timestamp: u64,
+}
+
+/// Dispute record
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub user: Address,
+    pub reason: Symbol,
+    pub evidence_hash: Option<BytesN<32>>,
+    pub stake: i128,
     pub timestamp: u64,
 }
 
@@ -417,18 +446,17 @@ impl PredictionMarket {
             .get(&Symbol::new(&env, ORACLE_KEY))
             .expect("Oracle address not found");
 
-        // TODO: Cross-contract call to Oracle - requires Oracle contract to be deployed
-        // For now, using placeholder values since Oracle contract is built separately
-        // Uncomment when Oracle is deployed and address is available
-        // let oracle_client = crate::oracle::OracleManagerClient::new(&env, &oracle_address);
-        // let (consensus_reached, final_outcome) = oracle_client.check_consensus(&market_id);
-        // if !consensus_reached {
-        //     panic!("Oracle consensus not reached");
-        // }
+        // Cross-contract call to Oracle to check consensus
+        let result: (bool, u32) = env.invoke_contract(
+            &oracle_address,
+            &Symbol::new(&env, "check_consensus"),
+            (market_id.clone(),).into_val(&env),
+        );
+        let (consensus_reached, final_outcome) = result;
 
-        // TEMPORARY: Simulate oracle consensus for testing (outcome = 1 for YES)
-        let consensus_reached = true;
-        let final_outcome = 1u32;
+        if !consensus_reached {
+            panic!("Oracle consensus not reached");
+        }
 
         // Validate outcome is binary (0 or 1)
         if final_outcome > 1 {
@@ -495,8 +523,108 @@ impl PredictionMarket {
     /// - Increment dispute counter
     /// - Emit MarketDisputed(user, reason, market_id, timestamp)
     /// - Notify admin of dispute
-    pub fn dispute_market(env: Env, user: Address, market_id: BytesN<32>, dispute_reason: Symbol) {
-        todo!("See dispute market TODO above")
+    pub fn dispute_market(
+        env: Env,
+        user: Address,
+        market_id: BytesN<32>,
+        dispute_reason: Symbol,
+        evidence_hash: Option<BytesN<32>>,
+        stake: i128,
+    ) -> Result<(), MarketError> {
+        // 1. Require user authentication
+        user.require_auth();
+
+        // 2. Validate market state is RESOLVED
+        let market_state: u32 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, MARKET_STATE_KEY))
+            .ok_or(MarketError::NotInitialized)?;
+
+        if market_state != STATE_RESOLVED {
+            return Err(MarketError::InvalidMarketState);
+        }
+
+        // 3. Validate within 7-day dispute window (604800 seconds)
+        let resolution_time: u64 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, RESOLUTION_TIME_KEY))
+            .ok_or(MarketError::NotInitialized)?;
+
+        let current_time = env.ledger().timestamp();
+        let dispute_deadline = resolution_time + 604800; // 7 days in seconds
+        if current_time >= dispute_deadline {
+            return Err(MarketError::DisputeWindowExpired);
+        }
+
+        // 4. Validate user participated in the market (has a prediction)
+        let prediction_key = (Symbol::new(&env, PREDICTION_PREFIX), user.clone());
+        let _prediction: UserPrediction = env
+            .storage()
+            .persistent()
+            .get(&prediction_key)
+            .ok_or(MarketError::NotParticipant)?;
+
+        // 5. Validate stake meets minimum
+        if stake < MIN_DISPUTE_STAKE {
+            return Err(MarketError::InsufficientDisputeStake);
+        }
+
+        // 6. Check for duplicate dispute from same user
+        let dispute_key = (Symbol::new(&env, DISPUTE_PREFIX), user.clone());
+        if env.storage().persistent().has(&dispute_key) {
+            return Err(MarketError::DuplicateDispute);
+        }
+
+        // 7. Transfer dispute stake from user to contract escrow
+        let usdc_token: Address = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, USDC_KEY))
+            .ok_or(MarketError::NotInitialized)?;
+
+        let token_client = token::TokenClient::new(&env, &usdc_token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&user, &contract_address, &stake);
+
+        // 8. Store dispute record
+        let dispute_record = DisputeRecord {
+            user: user.clone(),
+            reason: dispute_reason.clone(),
+            evidence_hash: evidence_hash.clone(),
+            stake,
+            timestamp: current_time,
+        };
+        env.storage().persistent().set(&dispute_key, &dispute_record);
+
+        // 9. Transition market state to DISPUTED
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, MARKET_STATE_KEY), &STATE_DISPUTED);
+
+        // 10. Freeze payouts
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, PAYOUTS_FROZEN_KEY), &true);
+
+        // 11. Increment dispute counter
+        let dispute_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, DISPUTE_COUNT_KEY))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, DISPUTE_COUNT_KEY), &(dispute_count + 1));
+
+        // 12. Emit MarketDisputed event
+        env.events().publish(
+            (Symbol::new(&env, "MarketDisputed"),),
+            (user, dispute_reason, market_id, current_time),
+        );
+
+        Ok(())
     }
 
     /// Claim winnings after market resolution
@@ -533,6 +661,16 @@ impl PredictionMarket {
 
         if state != STATE_RESOLVED {
             panic!("Market not resolved");
+        }
+
+        // Check if payouts are frozen due to dispute
+        let payouts_frozen: bool = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, PAYOUTS_FROZEN_KEY))
+            .unwrap_or(false);
+        if payouts_frozen {
+            panic!("Payouts are frozen due to active dispute");
         }
 
         // 2. Get User Prediction
@@ -785,6 +923,58 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .get(&Symbol::new(&env, WINNING_OUTCOME_KEY))
+    }
+
+    // --- DISPUTE HELPERS AND GETTERS ---
+
+    /// Get the number of disputes filed for this market
+    pub fn get_dispute_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&Symbol::new(&env, DISPUTE_COUNT_KEY))
+            .unwrap_or(0)
+    }
+
+    /// Get a user's dispute record
+    pub fn get_dispute(env: Env, user: Address) -> Option<DisputeRecord> {
+        let dispute_key = (Symbol::new(&env, DISPUTE_PREFIX), user);
+        env.storage().persistent().get(&dispute_key)
+    }
+
+    /// Check if payouts are frozen
+    pub fn is_payouts_frozen(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&Symbol::new(&env, PAYOUTS_FROZEN_KEY))
+            .unwrap_or(false)
+    }
+
+    /// Test helper: Setup market in DISPUTED state
+    pub fn test_setup_disputed(
+        env: Env,
+        _market_id: BytesN<32>,
+        outcome: u32,
+        winner_shares: i128,
+        loser_shares: i128,
+    ) {
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, MARKET_STATE_KEY), &STATE_RESOLVED);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, WINNING_OUTCOME_KEY), &outcome);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, WINNER_SHARES_KEY), &winner_shares);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, LOSER_SHARES_KEY), &loser_shares);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, PAYOUTS_FROZEN_KEY), &true);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, MARKET_STATE_KEY), &STATE_DISPUTED);
     }
 }
 
@@ -1275,5 +1465,346 @@ mod tests {
         oracle_client.set_consensus_status(&false);
 
         market_client.resolve_market(&market_id_bytes);
+    }
+
+    // ============================================================================
+    // DISPUTE MARKET TESTS
+    // ============================================================================
+
+    /// Helper to setup a resolved market ready for dispute testing
+    fn setup_resolved_market_for_dispute(
+        env: &Env,
+    ) -> (
+        PredictionMarketClient,
+        BytesN<32>,
+        Address,
+        token::StellarAssetClient,
+        Address,
+        u64,
+    ) {
+        let market_id_bytes = BytesN::from_array(env, &[0; 32]);
+        let market_contract_id = env.register(PredictionMarket, ());
+        let market_client = PredictionMarketClient::new(env, &market_contract_id);
+        let oracle_contract_id = env.register(MockOracle, ());
+
+        let token_admin = Address::generate(env);
+        let usdc_client = create_token_contract(env, &token_admin);
+        let usdc_address = usdc_client.address.clone();
+
+        let creator = Address::generate(env);
+
+        let closing_time = 2000u64;
+        let resolution_time = 3000u64;
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = 1000;
+        });
+
+        market_client.initialize(
+            &market_id_bytes,
+            &creator,
+            &Address::generate(env),
+            &usdc_address,
+            &oracle_contract_id,
+            &closing_time,
+            &resolution_time,
+        );
+
+        // Setup as resolved with a prediction for testing
+        market_client.test_setup_resolution(&market_id_bytes, &1u32, &1000i128, &0i128);
+
+        (
+            market_client,
+            market_id_bytes,
+            market_contract_id,
+            usdc_client,
+            usdc_address,
+            resolution_time,
+        )
+    }
+
+    #[test]
+    fn test_dispute_market_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, market_contract_id, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128; // Minimum stake
+
+        // Setup user prediction (required to be a participant)
+        market_client.test_set_prediction(&user, &1u32, &500);
+
+        // Mint USDC for dispute stake
+        usdc_client.mint(&user, &stake);
+
+        // Set time within dispute window
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100; // Within 7-day window
+        });
+
+        // Dispute the market
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "wrong_result"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+        assert!(result.is_ok());
+
+        // Verify state transitioned to DISPUTED (3)
+        let state = market_client.get_market_state_value();
+        assert_eq!(state, Some(3));
+
+        // Verify payouts are frozen
+        assert!(market_client.is_payouts_frozen());
+
+        // Verify dispute count is 1
+        assert_eq!(market_client.get_dispute_count(), 1);
+
+        // Verify dispute record stored
+        let dispute = market_client.get_dispute(&user);
+        assert!(dispute.is_some());
+        let record = dispute.unwrap();
+        assert_eq!(record.user, user);
+        assert_eq!(record.stake, stake);
+
+        // Verify stake was transferred to contract
+        assert_eq!(usdc_client.balance(&user), 0);
+        assert_eq!(usdc_client.balance(&market_contract_id), stake);
+    }
+
+    #[test]
+    fn test_dispute_non_resolved_market_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let market_id_bytes = BytesN::from_array(&env, &[0; 32]);
+        let market_contract_id = env.register(PredictionMarket, ());
+        let market_client = PredictionMarketClient::new(&env, &market_contract_id);
+        let oracle_contract_id = env.register(MockOracle, ());
+        let token_admin = Address::generate(&env);
+        let usdc_client = create_token_contract(&env, &token_admin);
+
+        market_client.initialize(
+            &market_id_bytes,
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &usdc_client.address,
+            &oracle_contract_id,
+            &2000,
+            &3000,
+        );
+
+        // Market is OPEN, not RESOLVED
+        let user = Address::generate(&env);
+        market_client.test_set_prediction(&user, &1u32, &500);
+
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "wrong"),
+            &None::<BytesN<32>>,
+            &10_000_000i128,
+        );
+        assert_eq!(result, Err(Ok(MarketError::InvalidMarketState)));
+    }
+
+    #[test]
+    fn test_dispute_after_window_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, _, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128;
+        market_client.test_set_prediction(&user, &1u32, &500);
+        usdc_client.mint(&user, &stake);
+
+        // Set time PAST the 7-day dispute window
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 604800 + 1; // Past 7 days
+        });
+
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "late"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+        assert_eq!(result, Err(Ok(MarketError::DisputeWindowExpired)));
+    }
+
+    #[test]
+    fn test_dispute_non_participant_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, _, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128;
+        usdc_client.mint(&user, &stake);
+
+        // User has NO prediction - not a participant
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100;
+        });
+
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "unfair"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+        assert_eq!(result, Err(Ok(MarketError::NotParticipant)));
+    }
+
+    #[test]
+    fn test_dispute_insufficient_stake_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, _, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let low_stake = 1_000_000i128; // Below 10 USDC minimum
+        market_client.test_set_prediction(&user, &1u32, &500);
+        usdc_client.mint(&user, &low_stake);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100;
+        });
+
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "reason"),
+            &None::<BytesN<32>>,
+            &low_stake,
+        );
+        assert_eq!(result, Err(Ok(MarketError::InsufficientDisputeStake)));
+    }
+
+    #[test]
+    fn test_dispute_duplicate_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, _, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128;
+        market_client.test_set_prediction(&user, &1u32, &500);
+        usdc_client.mint(&user, &(stake * 2));
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100;
+        });
+
+        // First dispute succeeds
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "first"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+        assert!(result.is_ok());
+
+        // Need to set state back to RESOLVED for second attempt
+        // (since first dispute moved it to DISPUTED)
+        market_client.test_setup_resolution(&market_id_bytes, &1u32, &1000, &0);
+
+        // Second dispute from same user should fail
+        let result2 = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "second"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+        assert_eq!(result2, Err(Ok(MarketError::DuplicateDispute)));
+    }
+
+    #[test]
+    #[should_panic(expected = "Payouts are frozen due to active dispute")]
+    fn test_claim_winnings_frozen_during_dispute() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, market_contract_id, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128;
+
+        // Setup user as winner
+        market_client.test_set_prediction(&user, &1u32, &1000);
+        usdc_client.mint(&user, &stake);
+        usdc_client.mint(&market_contract_id, &1000);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100;
+        });
+
+        // File dispute
+        market_client.dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "wrong"),
+            &None::<BytesN<32>>,
+            &stake,
+        );
+
+        // Reset state to RESOLVED but keep frozen flag
+        // (simulating that market was re-checked but payouts still frozen)
+        market_client.test_setup_resolution(&market_id_bytes, &1u32, &1000, &0);
+
+        // Claim should panic because payouts are frozen
+        market_client.claim_winnings(&user, &market_id_bytes);
+    }
+
+    #[test]
+    fn test_dispute_with_evidence_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (market_client, market_id_bytes, _, usdc_client, _, resolution_time) =
+            setup_resolved_market_for_dispute(&env);
+
+        let user = Address::generate(&env);
+        let stake = 10_000_000i128;
+        market_client.test_set_prediction(&user, &1u32, &500);
+        usdc_client.mint(&user, &stake);
+
+        let evidence = BytesN::from_array(&env, &[0xAB; 32]);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = resolution_time + 100;
+        });
+
+        let result = market_client.try_dispute_market(
+            &user,
+            &market_id_bytes,
+            &Symbol::new(&env, "evidence"),
+            &Some(evidence.clone()),
+            &stake,
+        );
+        assert!(result.is_ok());
+
+        // Verify evidence hash is stored
+        let dispute = market_client.get_dispute(&user).unwrap();
+        assert_eq!(dispute.evidence_hash, Some(evidence));
     }
 }

@@ -693,3 +693,182 @@ fn test_single_winner_gets_all() {
     let payout = client.claim_winnings(&winner, &market_id);
     assert_eq!(payout, 900);
 }
+
+// ============================================================================
+// DISPUTE MARKET INTEGRATION TESTS
+// ============================================================================
+
+/// Helper to setup a resolved market ready for dispute integration testing
+fn setup_resolved_market_for_dispute(
+    env: &Env,
+) -> (
+    PredictionMarketClient,
+    BytesN<32>,
+    token::StellarAssetClient,
+    Address,
+    u64,
+) {
+    let market_contract = register_market(env);
+    let client = PredictionMarketClient::new(env, &market_contract);
+
+    let market_id = BytesN::from_array(env, &[1u8; 32]);
+    let creator = Address::generate(env);
+    let admin = Address::generate(env);
+
+    let (token_client, usdc_address) = create_usdc_token(env, &admin);
+
+    let closing_time = env.ledger().timestamp() + 86400;
+    let resolution_time = closing_time + 3600;
+
+    env.mock_all_auths();
+
+    let oracle = Address::generate(env);
+
+    client.initialize(
+        &market_id,
+        &creator,
+        &Address::generate(env),
+        &usdc_address,
+        &oracle,
+        &closing_time,
+        &resolution_time,
+    );
+
+    // Setup as resolved
+    client.test_setup_resolution(&market_id, &1u32, &1000i128, &500i128);
+
+    (client, market_id, token_client, market_contract, resolution_time)
+}
+
+#[test]
+fn test_dispute_market_integration() {
+    let env = create_test_env();
+    let (client, market_id, token_client, market_contract, resolution_time) =
+        setup_resolved_market_for_dispute(&env);
+
+    let user = Address::generate(&env);
+    let stake = 10_000_000i128;
+
+    // User must be a participant
+    client.test_set_prediction(&user, &1u32, &500);
+
+    // Mint USDC for stake
+    token_client.mint(&user, &stake);
+
+    // Advance time to within dispute window
+    env.ledger().set(LedgerInfo {
+        timestamp: resolution_time + 1000,
+        protocol_version: 23,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 16,
+        max_entry_ttl: 6312000,
+    });
+
+    // File dispute
+    let result = client.try_dispute_market(
+        &user,
+        &market_id,
+        &soroban_sdk::Symbol::new(&env, "wrong_outcome"),
+        &None::<BytesN<32>>,
+        &stake,
+    );
+    assert!(result.is_ok());
+
+    // Verify state = DISPUTED (3)
+    let state = client.get_market_state_value();
+    assert_eq!(state, Some(3));
+
+    // Verify payouts frozen
+    assert!(client.is_payouts_frozen());
+
+    // Verify dispute count
+    assert_eq!(client.get_dispute_count(), 1);
+
+    // Verify stake transferred
+    assert_eq!(token_client.balance(&user), 0);
+    assert_eq!(token_client.balance(&market_contract), stake);
+}
+
+#[test]
+fn test_dispute_with_evidence_hash_integration() {
+    let env = create_test_env();
+    let (client, market_id, token_client, _, resolution_time) =
+        setup_resolved_market_for_dispute(&env);
+
+    let user = Address::generate(&env);
+    let stake = 20_000_000i128; // Above minimum
+    let evidence = BytesN::from_array(&env, &[0xDE; 32]);
+
+    client.test_set_prediction(&user, &0u32, &300);
+    token_client.mint(&user, &stake);
+
+    env.ledger().set(LedgerInfo {
+        timestamp: resolution_time + 500,
+        protocol_version: 23,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 16,
+        max_entry_ttl: 6312000,
+    });
+
+    let result = client.try_dispute_market(
+        &user,
+        &market_id,
+        &soroban_sdk::Symbol::new(&env, "fraud"),
+        &Some(evidence.clone()),
+        &stake,
+    );
+    assert!(result.is_ok());
+
+    // Verify evidence hash stored
+    let dispute = client.get_dispute(&user).unwrap();
+    assert_eq!(dispute.evidence_hash, Some(evidence));
+    assert_eq!(dispute.stake, stake);
+}
+
+#[test]
+#[should_panic(expected = "Payouts are frozen due to active dispute")]
+fn test_claim_blocked_after_dispute_integration() {
+    let env = create_test_env();
+    let (client, market_id, token_client, market_contract, resolution_time) =
+        setup_resolved_market_for_dispute(&env);
+
+    let user = Address::generate(&env);
+    let stake = 10_000_000i128;
+
+    // Setup user as winning participant
+    client.test_set_prediction(&user, &1u32, &1000);
+    token_client.mint(&user, &stake);
+    token_client.mint(&market_contract, &1500); // For potential payout
+
+    env.ledger().set(LedgerInfo {
+        timestamp: resolution_time + 100,
+        protocol_version: 23,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 16,
+        max_entry_ttl: 6312000,
+    });
+
+    // File dispute first
+    client.dispute_market(
+        &user,
+        &market_id,
+        &soroban_sdk::Symbol::new(&env, "challenge"),
+        &None::<BytesN<32>>,
+        &stake,
+    );
+
+    // Reset state to RESOLVED but frozen flag stays
+    client.test_setup_resolution(&market_id, &1u32, &1000, &500);
+
+    // Attempt to claim — should panic
+    client.claim_winnings(&user, &market_id);
+}
