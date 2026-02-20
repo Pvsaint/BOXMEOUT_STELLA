@@ -411,7 +411,9 @@ impl OracleManager {
             (Symbol::new(&env, "ResolutionFinalized"),),
             (market_id, final_outcome, current_time),
         );
-    /// TODO: Finalize Resolution
+    }
+
+    /// TODO: Finalize Resolution (simplified version)
     /// - Validate market_id exists
     /// - Validate consensus already reached
     /// - Validate time_delay_before_finality has passed
@@ -421,7 +423,7 @@ impl OracleManager {
     /// - Pass winning_outcome to market
     /// - Confirm resolution recorded
     /// - Emit ResolutionFinalized(market_id, outcome, timestamp)
-    pub fn finalize_resolution(_env: Env, _market_id: BytesN<32>) {
+    pub fn finalize_resolution_simple(_env: Env, _market_id: BytesN<32>) {
         todo!("See finalize resolution TODO above")
     }
 

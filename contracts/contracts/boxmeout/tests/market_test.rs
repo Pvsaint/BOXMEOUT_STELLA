@@ -737,7 +737,13 @@ fn setup_resolved_market_for_dispute(
     // Setup as resolved
     client.test_setup_resolution(&market_id, &1u32, &1000i128, &500i128);
 
-    (client, market_id, token_client, market_contract, resolution_time)
+    (
+        client,
+        market_id,
+        token_client,
+        market_contract,
+        resolution_time,
+    )
 }
 
 #[test]
