@@ -596,7 +596,9 @@ impl PredictionMarket {
             stake,
             timestamp: current_time,
         };
-        env.storage().persistent().set(&dispute_key, &dispute_record);
+        env.storage()
+            .persistent()
+            .set(&dispute_key, &dispute_record);
 
         // 9. Transition market state to DISPUTED
         env.storage()
