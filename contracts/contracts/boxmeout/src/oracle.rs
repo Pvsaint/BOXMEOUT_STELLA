@@ -545,7 +545,7 @@ impl OracleManager {
             // Challenge is valid - oracle was dishonest
 
             // 6a. Reduce oracle's reputation/accuracy score (reduce by 20%)
-            accuracy = if accuracy >= 20 { accuracy - 20 } else { 0 };
+            accuracy = accuracy.saturating_sub(20);
             new_reputation = accuracy;
 
             // 6b. Slash oracle's stake (50% of stake)
